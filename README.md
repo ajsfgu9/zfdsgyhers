@@ -10,68 +10,27 @@ Ouroboros combines five complementary agent paradigms into a single zero-depende
 | :--- | :--- | :--- |
 | **Gemini Task Mode** | Two-phase planning (`Phase 1` decomposition + `Phase 2` live `TASK.md` milestone state machine), parallel tool fan-out, and on-demand `lookup_skills` | `ouroboros/loop.py`, `ouroboros/memory.py` |
 | **Nous Hermes Agent** | Strict message role alternation, preflight context compression (>50% window without splitting tool pairs), and **Closed Learning Loop** (`save_skill` after >=5 tool calls) | `ouroboros/loop.py`, `ouroboros/skills.py` |
-| **OpenClaw** | Event-driven HTTP Gateway (`/v1/tasks`, `/v1/state`, `/healthz`) and scheduled cron wakeups without CPU busy-polling | `ouroboros/gateway.py`, `main.py` |
+| **OpenClaw** | Event-driven HTTP Gateway (`/v1/tasks`, `/v1/state`, `/v1/reload`, `/v1/telegram/webhook`, `/healthz`) and bidirectional Telegram Bot API bridge | `ouroboros/gateway.py`, `ouroboros/telegram_bot.py`, `main.py` |
 | **Grok Bot & Meta Muse** | Chief-of-Staff recursive sub-agent delegation (`delegate_subagent` with isolated context and bounded `IterationBudget`) + Sentinel fail-closed `Tier 2` guards | `ouroboros/tools.py`, `ouroboros/loop.py` |
 | **Code Review Governance** | Concise `AGENTS.md` (<150 lines), failure-mode `REVIEW.md`, diff-driven `CODEOWNERS` (`Tier 0/1/2`), and automated circuit breakers + `incident_evals.jsonl` | `AGENTS.md`, `REVIEW.md`, `scripts/circuit_breaker.py` |
 
-## Repository Structure
+## Telegram Bot API Integration
 
-```text
-ouroboros-agent/
-├── AGENTS.md                              # <150-line architectural map & invariants for AI/human reviewers
-├── REVIEW.md                              # Subsystem failure definitions, file:line evidence rules, 3-round cap
-├── CODEOWNERS                             # Risk-tiered ownership (Tier 0 = 0 humans, Tier 1 = 1, Tier 2 = 2)
-├── Dockerfile                             # Production container image for dedicated servers
-├── docker-compose.yml                     # Single-command server deployment with persistent volumes
-├── main.py                                # CLI & HTTP/Cron Gateway Daemon entrypoint
-├── pyproject.toml                         # Standard Python package manifest
-├── .env.example                           # Environment configuration template
-├── .github/
-│   ├── pull_request_template.md           # Blast-radius & <5 min rollback attestation
-│   └── workflows/governance-gate.yml      # Automated test + circuit-breaker CI gate
-├── ouroboros/
-│   ├── config.py                          # Dataclass runtime & Sentinel Tier-2 pattern config
-│   ├── loop.py                            # Recursive ReAct + TASK.md checklist + closed learning loop
-│   ├── memory.py                          # Three-tier memory (SOUL.md, MEMORY.md, TASK.md) + SQLite WAL store
-│   ├── skills.py                          # Dynamic SKILL.md loader, resource reader, and skill creator
-│   ├── tools.py                           # ThreadPoolExecutor parallel tool runner & Sentinel risk classifier
-│   └── gateway.py                         # Event-driven REST control plane & scheduled routine dispatcher
-├── skills/
-│   ├── skill-creator/SKILL.md             # Closed learning loop skill-authoring runbook
-│   ├── self-healer/SKILL.md               # Dedicated server systemd/Docker/disk auto-remediation skill
-│   └── code-review-governance/SKILL.md    # Governance audit skill
-├── scripts/
-│   └── circuit_breaker.py                 # Revert-rate, Sev-1/2, convergence, & churn circuit breaker CLI
-├── evals/
-│   ├── incident_evals.jsonl               # Golden incident regression dataset
-│   └── telemetry_window.json              # Rolling 7-day merge & revert telemetry
-├── systemd/
-│   └── ouroboros.service                  # Native Linux systemd daemon unit
-└── tests/
-    └── test_ouroboros.py                  # Full unit & integration test suite
+Send commands and receive outputs directly from Telegram:
+1. Message `@BotFather` on Telegram -> `/newbot` -> copy your token into `.env` as `OUROBOROS_TELEGRAM_BOT_TOKEN=<token>`.
+2. Start the agent (`python3 main.py --mode daemon` or `python3 main.py --mode telegram`) and send `/id` to your bot on Telegram.
+3. Copy your `chat_id` into `.env` as `OUROBOROS_TELEGRAM_ALLOWED_CHAT_IDS=<your_chat_id>` and restart the service.
+4. Use Telegram commands anytime:
+   - `<any text>` or `/task <prompt>` — Run a full autonomous agent task with persistent chat memory.
+   - `/cmd <linux_command>` — Execute a Linux shell command directly and receive `exit_code`, `stdout`, and `stderr`.
+   - `/approve <id>` / `/deny <id>` — Approve or reject high-risk Sentinel Tier-2 commands directly from Telegram.
+   - `/skills` or `/reload` — Hot-reload `skills/*/SKILL.md` files from disk without restarting the server.
+   - `/status` — View active `TASK.md` checklist and installed skills.
+
+## In-Place Upgrade on Existing Linux Servers
+
+If `/opt/ouroboros-agent` already exists and `git clone` fails with `destination path already exists and is not an empty directory`, run:
+```bash
+bash scripts/upgrade_in_place.sh /opt/ouroboros-agent
 ```
-
-## Quick Start (Dedicated Linux Server)
-
-1. **Clone & Configure Environment**:
-   ```bash
-   git clone https://github.com/<your-org>/ouroboros-agent.git
-   cd ouroboros-agent
-   cp .env.example .env
-   # Edit .env with your OpenAI / Anthropic / OpenRouter / local vLLM API key
-   ```
-
-2. **Run Verification & Governance Suite**:
-   ```bash
-   python3 -m unittest discover -s tests -v
-   python3 scripts/circuit_breaker.py --changed-files ouroboros/loop.py
-   ```
-
-3. **Run Interactive CLI or Daemon Mode**:
-   ```bash
-   # Single autonomous task
-   python3 main.py --mode task --prompt "Audit disk space, check failed systemd units, and record findings"
-
-   # Persistent HTTP & Scheduled Routine Daemon
-   python3 main.py --mode daemon --host 127.0.0.1 --port 8787
-   ```
+This preserves `.env` and `workspace_state/`, repairs Linux ownership on `skills/`, runs the test suite, and restarts `ouroboros.service`.

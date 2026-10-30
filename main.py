@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI & Server Daemon Entrypoint for Ouroboros Recursive Autonomous Manager Agent."""
+"""CLI, Telegram Bot, & Server Daemon Entrypoint for Ouroboros Recursive Autonomous Manager Agent."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import sys
 from ouroboros.config import AgentConfig
 from ouroboros.gateway import OuroborosGatewayServer, ScheduledRoutine
 from ouroboros.loop import OuroborosManagerAgent
+from ouroboros.telegram_bot import TelegramBotBridge
 
 
 def main() -> int:
@@ -18,14 +19,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["task", "chat", "daemon"],
+        choices=["task", "chat", "daemon", "telegram"],
         default="task",
-        help="Execution mode: single autonomous task, interactive REPL chat, or background gateway daemon.",
+        help="Execution mode: single task, interactive REPL chat, HTTP+Telegram daemon, or standalone Telegram bot.",
     )
     parser.add_argument("--prompt", help="Task prompt when running in --mode task.")
     parser.add_argument("--session-id", default=None, help="Optional session ID to resume.")
     parser.add_argument("--host", default="127.0.0.1", help="Gateway bind address.")
     parser.add_argument("--port", type=int, default=8787, help="Gateway bind port.")
+    parser.add_argument(
+        "--no-telegram-poll",
+        action="store_true",
+        help="Disable background Telegram long-polling in --mode daemon (use when receiving webhooks via /v1/telegram/webhook).",
+    )
     args = parser.parse_args()
 
     config = AgentConfig()
@@ -55,6 +61,20 @@ def main() -> int:
             print("\n" + str(res["final_response"]) + "\n")
         return 0
 
+    if args.mode == "telegram":
+        bridge = TelegramBotBridge(agent=agent)
+        if not bridge.is_configured:
+            print(
+                "Error: OUROBOROS_TELEGRAM_BOT_TOKEN is not set in environment or .env.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Ouroboros Telegram Bot long-polling active (allowed_chats={bridge.allowed_chat_ids})."
+        )
+        bridge.serve_polling_forever()
+        return 0
+
     routines = [
         ScheduledRoutine(
             name="hourly_self_heal_audit",
@@ -63,9 +83,18 @@ def main() -> int:
         )
     ]
     gateway = OuroborosGatewayServer(
-        agent=agent, host=args.host, port=args.port, routines=routines
+        agent=agent,
+        host=args.host,
+        port=args.port,
+        routines=routines,
+        enable_telegram_polling=not args.no_telegram_poll,
     )
     print(f"Ouroboros Gateway listening on http://{args.host}:{args.port}")
+    if gateway.telegram.is_configured:
+        mode_label = "Webhook-Only" if args.no_telegram_poll else "Background Long-Polling + Webhook"
+        print(
+            f"Telegram Bot Bridge active ({mode_label}, allowed_chats={gateway.telegram.allowed_chat_ids})"
+        )
     gateway.serve_forever()
     return 0
 
