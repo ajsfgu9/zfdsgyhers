@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ouroboros-agent"
+version = "0.1.0"
+description = "Recursive Autonomous Manager Agent for Dedicated Servers with Dynamic Skills and Code Review Governance"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+ouroboros = "main:main"

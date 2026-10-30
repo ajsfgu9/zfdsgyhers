@@ -1,0 +1,19 @@
+# Risk-Tiered Ownership & Approval Routing (@code-review-governance)
+# Tier 0 (Low Risk — 0 Humans when Circuit Breaker is CLOSED): docs, tests, non-executable skill markdown
+/docs/                          @ouroboros-maintainers
+/tests/                         @ouroboros-maintainers
+
+# Tier 1 (Medium Risk — 1 Human + Blast-Radius Attestation): core loop, memory, skill scripts
+/ouroboros/                     @ouroboros-core-leads
+/skills/                        @ouroboros-core-leads
+
+# Tier 2 (High Risk — 2 Humans Mandatory): security boundaries, CI/CD, deployment, governance rules
+/ouroboros/tools.py             @ouroboros-security-leads @ouroboros-core-leads
+/scripts/circuit_breaker.py     @ouroboros-security-leads @ouroboros-core-leads
+/.github/workflows/             @ouroboros-security-leads @ouroboros-core-leads
+/Dockerfile                     @ouroboros-security-leads @ouroboros-core-leads
+/docker-compose.yml             @ouroboros-security-leads @ouroboros-core-leads
+/systemd/                       @ouroboros-security-leads @ouroboros-core-leads
+/AGENTS.md                      @ouroboros-security-leads @ouroboros-core-leads
+/REVIEW.md                      @ouroboros-security-leads @ouroboros-core-leads
+/CODEOWNERS                     @ouroboros-security-leads @ouroboros-core-leads

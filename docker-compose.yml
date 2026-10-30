@@ -1,0 +1,12 @@
+services:
+  ouroboros-agent:
+    build: .
+    container_name: ouroboros-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./workspace_state:/var/lib/ouroboros/workspace_state
+      - ./skills:/opt/ouroboros-agent/skills
