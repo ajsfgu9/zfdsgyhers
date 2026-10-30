@@ -252,5 +252,137 @@ class TestOuroborosAgentAndGovernance(unittest.TestCase):
         self.assertEqual(tier2["required_human_approvals"], 2)
 
 
+
+    def test_multi_agent_role_isolation_and_holdout_data_firewall(self) -> None:
+        """Verifies that Scout/Sweeper have isolated memory/workspaces and are blocked from Holdout data, while Skeptic is allowed."""
+        # Populate shared data slices
+        holdout_file = self.config.workspace_root / "data" / "holdout" / "oos_bars.csv"
+        develop_file = self.config.workspace_root / "data" / "develop" / "in_sample_bars.csv"
+        ledger_file = self.config.workspace_root / "ledger" / "research_ledger.jsonl"
+        holdout_file.parent.mkdir(parents=True, exist_ok=True)
+        develop_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        holdout_file.write_text("2026-10-01,100.5\n", encoding="utf-8")
+        develop_file.write_text("2025-01-01,95.0\n", encoding="utf-8")
+        ledger_file.write_text("", encoding="utf-8")
+
+        def fake_llm(
+            messages: List[Dict[str, Any]],
+            tools: List[Dict[str, Any]],
+            provider: ModelProviderConfig,
+        ) -> Dict[str, Any]:
+            sys_prompt = messages[0]["content"]
+            has_tool_response = any(m.get("role") == "tool" for m in messages)
+
+            # 1. Inside Sweeper sub-agent: try to record private memory AND illegally read Holdout data
+            if "Isolated Specialist Sub-Agent Role: sweeper" in sys_prompt:
+                if not has_tool_response:
+                    return {
+                        "role": "assistant",
+                        "content": "Sweeper recording private note and attempting holdout read.",
+                        "tool_calls": [
+                            {
+                                "id": "sw_mem",
+                                "function": {
+                                    "name": "record_memory",
+                                    "arguments": json.dumps({"fact": "Sweeper private bias note"}),
+                                },
+                            },
+                            {
+                                "id": "sw_illegal_holdout",
+                                "function": {
+                                    "name": "file_ops",
+                                    "arguments": json.dumps(
+                                        {"action": "read", "path": str(holdout_file)}
+                                    ),
+                                },
+                            },
+                            {
+                                "id": "sw_legal_dev",
+                                "function": {
+                                    "name": "file_ops",
+                                    "arguments": json.dumps(
+                                        {"action": "read", "path": str(develop_file)}
+                                    ),
+                                },
+                            },
+                        ],
+                    }
+                # Verify that the holdout read was blocked by the role firewall while develop read succeeded
+                tool_msgs = [m for m in messages if m.get("role") == "tool"]
+                return {
+                    "role": "assistant",
+                    "content": json.dumps([json.loads(m["content"]) if m["content"].startswith("{") else m["content"] for m in tool_msgs]),
+                }
+
+            # 2. Inside Skeptic sub-agent: verify its MEMORY.md does NOT contain Sweeper's note, and it CAN read Holdout
+            if "Isolated Specialist Sub-Agent Role: skeptic" in sys_prompt:
+                self.assertNotIn("Sweeper private bias note", sys_prompt)
+                if not has_tool_response:
+                    return {
+                        "role": "assistant",
+                        "content": "Skeptic reading untouched holdout slice.",
+                        "tool_calls": [
+                            {
+                                "id": "sk_holdout",
+                                "function": {
+                                    "name": "file_ops",
+                                    "arguments": json.dumps(
+                                        {"action": "read", "path": str(holdout_file)}
+                                    ),
+                                },
+                            },
+                            {
+                                "id": "sk_illegal_ledger_write",
+                                "function": {
+                                    "name": "file_ops",
+                                    "arguments": json.dumps(
+                                        {
+                                            "action": "write",
+                                            "path": str(ledger_file),
+                                            "content": "tamper",
+                                        }
+                                    ),
+                                },
+                            },
+                        ],
+                    }
+                tool_msgs = [m for m in messages if m.get("role") == "tool"]
+                return {
+                    "role": "assistant",
+                    "content": json.dumps([json.loads(m["content"]) if m["content"].startswith("{") else m["content"] for m in tool_msgs]),
+                }
+
+            return {"role": "assistant", "content": "Root done"}
+
+        lead_agent = OuroborosManagerAgent(config=self.config, llm_callable=fake_llm)
+
+        sweeper_res = lead_agent._spawn_child_agent(
+            role="sweeper",
+            objective="Run parameter sweep on develop slice.",
+            max_turns=4,
+            handoff_payload={"experiment_id": "2026-10-30-001", "grid": [10, 20]},
+        )
+        sweeper_outputs = json.loads(sweeper_res["summary"])
+        # Tool 2 (holdout read) must be blocked by role firewall!
+        self.assertEqual(sweeper_outputs[1]["status"], "blocked_by_role_firewall")
+        # Tool 3 (develop read) must succeed!
+        self.assertIn("2025-01-01,95.0", sweeper_outputs[2]["content"])
+
+        skeptic_res = lead_agent._spawn_child_agent(
+            role="skeptic",
+            objective="Audit survivor on holdout slice.",
+            max_turns=4,
+            handoff_payload={"experiment_id": "2026-10-30-001", "frozen_param": 20},
+        )
+        skeptic_outputs = json.loads(skeptic_res["summary"])
+        # Skeptic CAN read holdout_file
+        self.assertIn("2026-10-01,100.5", skeptic_outputs[0]["content"])
+        # Skeptic CANNOT overwrite the Librarian's append-only ledger
+        self.assertEqual(skeptic_outputs[1]["status"], "blocked_by_role_firewall")
+        # Confirm physical workspace separation
+        self.assertNotEqual(sweeper_res["isolated_workspace"], skeptic_res["isolated_workspace"])
+
+
 if __name__ == "__main__":
     unittest.main()

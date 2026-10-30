@@ -1,19 +1,18 @@
-"""Dedicated Server Tool Registry, Sentinel Risk-Tier Classifier, and Parallel Executor."""
+"""Dedicated Server Tool Registry, Role Sandbox Firewall, Sentinel Risk Classifier, and Parallel Executor."""
 
 from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
 import json
-import os
 import pathlib
 import subprocess
 import time
-import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import AgentConfig
 from ouroboros.memory import MemoryAndStateStore
+from ouroboros.multi_agent import RoleSandboxPolicy
 from ouroboros.skills import SkillRegistry
 
 
@@ -24,25 +23,29 @@ class ToolSpec:
     parameters: Dict[str, Any]
     handler: Callable[[Dict[str, Any]], Any]
     is_interactive: bool = False
-    default_risk_tier: str = "Tier 0"  # Tier 0 (Low) | Tier 1 (Medium) | Tier 2 (High)
+    default_risk_tier: str = "Tier 0"
 
 
 class ServerToolRegistry:
-    """Manages host server tools, background daemons, and Sentinel risk-tier checks."""
+    """Manages host server tools, role-level data-pollution firewalls, and Sentinel risk-tier checks."""
 
     def __init__(
         self,
         config: AgentConfig,
         memory: MemoryAndStateStore,
         skills: SkillRegistry,
-        subagent_spawner: Optional[Callable[[str, str, int], Dict[str, Any]]] = None,
+        subagent_spawner: Optional[Callable[[str, str, int, Optional[Dict[str, Any]]], Dict[str, Any]]] = None,
         approval_callback: Optional[Callable[[str, Dict[str, Any], str], bool]] = None,
+        role_policy: Optional[RoleSandboxPolicy] = None,
+        shared_root: Optional[pathlib.Path] = None,
     ) -> None:
         self.config = config
         self.memory = memory
         self.skills = skills
         self.subagent_spawner = subagent_spawner
         self.approval_callback = approval_callback
+        self.role_policy = role_policy
+        self.shared_root = (shared_root or config.workspace_root).resolve()
         self._tools: Dict[str, ToolSpec] = {}
         self._background_procs: Dict[str, subprocess.Popen[str]] = {}
         self._register_builtin_tools()
@@ -51,7 +54,6 @@ class ServerToolRegistry:
         self._tools[spec.name] = spec
 
     def classify_risk_tier(self, tool_name: str, args: Dict[str, Any]) -> str:
-        """Diff/action-driven Risk Tier classification per @code-review-governance."""
         serialized = json.dumps(args, sort_keys=True)
         for pattern in self.config.tier_2_sensitive_patterns:
             if pattern in serialized:
@@ -83,13 +85,14 @@ class ServerToolRegistry:
     def execute_tool_calls(
         self, session_id: str, tool_calls: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Executes multiple tool calls concurrently via ThreadPoolExecutor while preserving order."""
         if not tool_calls:
             return []
 
-        # If only 1 call or any call is interactive, execute sequentially
         if len(tool_calls) == 1 or any(
-            self._tools.get(tc.get("function", {}).get("name", ""), ToolSpec("", "", {}, lambda _: None)).is_interactive
+            self._tools.get(
+                tc.get("function", {}).get("name", ""),
+                ToolSpec("", "", {}, lambda _: None),
+            ).is_interactive
             for tc in tool_calls
         ):
             return [self._invoke_single(session_id, tc) for tc in tool_calls]
@@ -177,7 +180,7 @@ class ServerToolRegistry:
                 name="host_bash",
                 description=(
                     "Execute a shell command or manage background daemon tasks on the dedicated server. "
-                    "Supports synchronous execution with timeout or background daemon spawning."
+                    "Respects role-based data-pollution path firewalls when running inside a specialist sub-agent."
                 ),
                 parameters={
                     "type": "object",
@@ -200,7 +203,7 @@ class ServerToolRegistry:
         self.register(
             ToolSpec(
                 name="file_ops",
-                description="Read, write, or list files on the server filesystem.",
+                description="Read, write, or list files on the server filesystem (enforces role sandbox ACLs).",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -221,10 +224,7 @@ class ServerToolRegistry:
         self.register(
             ToolSpec(
                 name="update_task_checklist",
-                description=(
-                    "Update the Gemini-Task style Phase-2 milestone checklist (TASK.md) "
-                    "to track pending (- [ ]), in-progress (- [/]), and completed (- [x]) steps."
-                ),
+                description="Update the agent's private TASK.md milestone checklist.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -245,7 +245,7 @@ class ServerToolRegistry:
         self.register(
             ToolSpec(
                 name="record_memory",
-                description="Persist a durable architectural or operational fact to MEMORY.md.",
+                description="Persist a durable fact to this agent role's private MEMORY.md.",
                 parameters={
                     "type": "object",
                     "properties": {"fact": {"type": "string"}},
@@ -259,7 +259,7 @@ class ServerToolRegistry:
         self.register(
             ToolSpec(
                 name="lookup_skills",
-                description="Load full instructions from one or more installed skills by name.",
+                description="Load full instructions from one or more installed skills allowed for this role.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -267,7 +267,7 @@ class ServerToolRegistry:
                     },
                     "required": ["skill_names"],
                 },
-                handler=lambda args: self.skills.lookup_skills(args["skill_names"]),
+                handler=self._handle_lookup_skills,
                 default_risk_tier="Tier 0",
             )
         )
@@ -275,7 +275,7 @@ class ServerToolRegistry:
         self.register(
             ToolSpec(
                 name="get_skill_resources",
-                description="Fetch bundled template, script, or reference files from a skill.",
+                description="Fetch bundled template, script, or reference files from an allowed skill.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -284,9 +284,7 @@ class ServerToolRegistry:
                     },
                     "required": ["skill_name", "filenames"],
                 },
-                handler=lambda args: self.skills.get_skill_resources(
-                    args["skill_name"], args["filenames"]
-                ),
+                handler=self._handle_get_skill_resources,
                 default_risk_tier="Tier 0",
             )
         )
@@ -294,10 +292,7 @@ class ServerToolRegistry:
         self.register(
             ToolSpec(
                 name="save_skill",
-                description=(
-                    "Create or update a reusable SKILL.md package in the skills directory "
-                    "(Hermes closed learning loop)."
-                ),
+                description="Create or update a reusable SKILL.md package in the skills directory.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -324,16 +319,24 @@ class ServerToolRegistry:
             ToolSpec(
                 name="delegate_subagent",
                 description=(
-                    "Spawn a recursive child agent with an isolated context window and bounded "
-                    "iteration budget (Grok Bot Chief-of-Staff / Hermes delegate_task pattern)."
+                    "Spawn a strictly isolated specialist sub-agent (e.g., 'librarian', 'scout', "
+                    "'sweeper', 'skeptic') with its own private workspace, private MEMORY.md/TASK.md, "
+                    "data-wall path ACLs, and structured JSON handoff packet."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "role": {"type": "string", "description": "Specialist role name."},
+                        "role": {
+                            "type": "string",
+                            "description": "Specialist role ('librarian', 'scout', 'sweeper', 'skeptic', or custom).",
+                        },
                         "objective": {
                             "type": "string",
                             "description": "Self-contained task instructions and verification criteria.",
+                        },
+                        "handoff_payload": {
+                            "type": "object",
+                            "description": "Structured JSON data packet passed across the role boundary (prevents narrative bias).",
                         },
                         "max_turns": {"type": "integer", "description": "Child iteration cap."},
                     },
@@ -344,11 +347,52 @@ class ServerToolRegistry:
             )
         )
 
+    def _handle_lookup_skills(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        requested = list(args.get("skill_names", []))
+        if self.role_policy and self.role_policy.allowed_skills:
+            allowed_set = {s.lower() for s in self.role_policy.allowed_skills}
+            blocked = [
+                s for s in requested
+                if s.lower().replace("user:", "").replace("system:", "") not in allowed_set
+            ]
+            if blocked:
+                return {
+                    "error": (
+                        f"[ROLE_SKILL_FIREWALL] Role '{self.role_policy.role_name}' is only permitted "
+                        f"to load skills {sorted(allowed_set)}; blocked: {blocked}"
+                    )
+                }
+        return self.skills.lookup_skills(requested)
+
+    def _handle_get_skill_resources(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        skill_name = str(args.get("skill_name", ""))
+        clean = skill_name.lower().replace("user:", "").replace("system:", "")
+        if self.role_policy and self.role_policy.allowed_skills:
+            allowed_set = {s.lower() for s in self.role_policy.allowed_skills}
+            if clean not in allowed_set:
+                return {
+                    "error": (
+                        f"[ROLE_SKILL_FIREWALL] Role '{self.role_policy.role_name}' cannot access "
+                        f"resources from skill '{skill_name}'."
+                    )
+                }
+        return self.skills.get_skill_resources(skill_name, args.get("filenames", []))
+
     def _handle_host_bash(self, args: Dict[str, Any]) -> Dict[str, Any]:
         command = args["command"]
         cwd = args.get("cwd") or str(self.config.workspace_root)
         timeout_sec = int(args.get("timeout_sec", 30))
         background = bool(args.get("background", False))
+
+        if self.role_policy:
+            violation = self.role_policy.check_bash_command(command)
+            if violation:
+                return {"status": "blocked_by_role_firewall", "error": violation}
+            cwd_violation = self.role_policy.check_path_access(
+                pathlib.Path(cwd), "read", self.shared_root
+            )
+            if cwd_violation:
+                return {"status": "blocked_by_role_firewall", "error": cwd_violation}
 
         if background:
             task_id = f"bg_{int(time.time() * 1000)}"
@@ -387,6 +431,12 @@ class ServerToolRegistry:
     def _handle_file_ops(self, args: Dict[str, Any]) -> Dict[str, Any]:
         action = args["action"]
         target = pathlib.Path(args["path"]).expanduser().resolve()
+
+        if self.role_policy:
+            violation = self.role_policy.check_path_access(target, action, self.shared_root)
+            if violation:
+                return {"status": "blocked_by_role_firewall", "error": violation}
+
         if action == "read":
             if not target.exists():
                 return {"error": f"File not found: {target}"}
@@ -418,4 +468,5 @@ class ServerToolRegistry:
         role = args["role"]
         objective = args["objective"]
         max_turns = int(args.get("max_turns", self.config.subagent_max_turns))
-        return self.subagent_spawner(role, objective, max_turns)
+        handoff_payload = args.get("handoff_payload")
+        return self.subagent_spawner(role, objective, max_turns, handoff_payload)

@@ -1,17 +1,22 @@
-"""Core Recursive Manager Loop combining Gemini Task, Hermes Agent, OpenClaw, and Grok Bot/Muse."""
+"""Core Recursive Manager Loop with Role-Separated Multi-Agent Isolation (v0.2.0)."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
-import time
-import urllib.error
+import pathlib
 import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import AgentConfig, ModelProviderConfig
 from ouroboros.memory import MemoryAndStateStore
+from ouroboros.multi_agent import (
+    QuantDeskLayout,
+    RoleSandboxPolicy,
+    build_quant_desk_policies,
+)
 from ouroboros.skills import SkillRegistry
 from ouroboros.tools import ServerToolRegistry
 
@@ -20,7 +25,7 @@ LLMCallable = Callable[[List[Dict[str, Any]], List[Dict[str, Any]], ModelProvide
 
 
 class OuroborosManagerAgent:
-    """Recursive Autonomous Manager Agent with checklist planning, skill learning, and sub-agents."""
+    """Recursive Autonomous Manager Agent with role-isolated sub-agents and data-pollution firewalls."""
 
     def __init__(
         self,
@@ -28,10 +33,21 @@ class OuroborosManagerAgent:
         llm_callable: Optional[LLMCallable] = None,
         recursion_depth: int = 0,
         approval_callback: Optional[Callable[[str, Dict[str, Any], str], bool]] = None,
+        role_policy: Optional[RoleSandboxPolicy] = None,
+        shared_root: Optional[pathlib.Path] = None,
+        role_policies_registry: Optional[Dict[str, RoleSandboxPolicy]] = None,
     ) -> None:
         self.config = config or AgentConfig()
         self.config.ensure_directories()
         self.recursion_depth = recursion_depth
+        self.role_policy = role_policy
+        self.shared_root = (shared_root or self.config.workspace_root).resolve()
+        self.quant_layout = QuantDeskLayout(self.shared_root)
+        self.quant_layout.ensure_structure()
+        self.role_policies_registry = role_policies_registry or build_quant_desk_policies(
+            frontier_model=os.environ.get("OUROBOROS_SKEPTIC_MODEL"),
+            fast_model=os.environ.get("OUROBOROS_SWEEPER_MODEL"),
+        )
         self.memory = MemoryAndStateStore(self.config.workspace_root)
         self.skills = SkillRegistry(self.config.skills_dir)
         self.llm_callable = llm_callable or self._default_openai_compatible_call
@@ -41,35 +57,47 @@ class OuroborosManagerAgent:
             skills=self.skills,
             subagent_spawner=self._spawn_child_agent,
             approval_callback=approval_callback,
+            role_policy=self.role_policy,
+            shared_root=self.shared_root,
         )
 
     def build_system_prompt(self, role_override: Optional[str] = None) -> str:
-        """Assembles the prompt from SOUL.md, MEMORY.md, TASK.md, and the live Skill Catalog."""
         soul = self.memory.read_soul().strip()
-        if role_override:
-            soul += f"\n\n## Specialist Sub-Agent Role: {role_override}\nFocus strictly on the delegated objective."
+        active_role = role_override or (self.role_policy.role_name if self.role_policy else None)
+        if active_role:
+            soul += (
+                f"\n\n## Isolated Specialist Sub-Agent Role: {active_role}\n"
+                "You are running inside a physically isolated role workspace. "
+                "Your `MEMORY.md`, `TASK.md`, and `state.db` are strictly separated from other agents "
+                "to prevent data and narrative pollution."
+            )
+            if self.role_policy:
+                soul += (
+                    f"\n- Role Purpose: {self.role_policy.description}"
+                    f"\n- Allowed Skills: {self.role_policy.allowed_skills}"
+                    f"\n- Forbidden Paths (Data Wall): {self.role_policy.denied_path_prefixes}"
+                    f"\n- Read-Only Paths: {self.role_policy.readonly_path_prefixes}"
+                )
+
         memory_text = self.memory.read_memory().strip()
         task_text = self.memory.read_task_checklist().strip()
         skill_catalog = self.skills.list_catalog_prompt()
 
         return (
             f"{soul}\n\n"
-            "## Phase 1 & Phase 2 Recursive Planning Protocol (Gemini Task Pattern)\n"
-            "1. For any multi-step engineering or server management request, first update `TASK.md` "
-            "via `update_task_checklist` with concrete verification milestones (`- [ ]`, `- [/]`, `- [x]`).\n"
-            "2. Check the Available Skills below. If a skill matches your task, call `lookup_skills` "
-            "before writing custom scripts.\n"
-            "3. Emit independent tool calls in the same turn so the runtime executes them in parallel.\n"
-            "4. When a complex workflow requires >=5 tool calls and reveals a reusable server pattern, "
-            "crystallize it into a new skill via `save_skill` before finishing.\n\n"
+            "## Phase 1 & Phase 2 Recursive Planning Protocol\n"
+            "1. Update `TASK.md` via `update_task_checklist` with concrete verification milestones.\n"
+            "2. Check Available Skills and call `lookup_skills` before writing custom code.\n"
+            "3. Emit independent tool calls in the same turn for parallel execution.\n"
+            "4. For multi-agent workflows (such as `@quant-research-lead`), delegate to isolated specialist roles "
+            "(`librarian`, `scout`, `sweeper`, `skeptic`) via `delegate_subagent` with a structured `handoff_payload`.\n\n"
             f"## Active Milestone Checklist (`TASK.md`)\n{task_text}\n\n"
-            f"## Durable Server Memory (`MEMORY.md`)\n{memory_text}\n\n"
+            f"## Private Role Memory (`MEMORY.md`)\n{memory_text}\n\n"
             f"## Available On-Demand Skills (`SKILL.md` Catalog)\n{skill_catalog}\n"
         )
 
     @staticmethod
     def validate_message_alternation(messages: List[Dict[str, Any]]) -> bool:
-        """Enforces Hermes Agent strict role alternation invariant."""
         if not messages or messages[0].get("role") != "system":
             return False
         prev_role = "system"
@@ -86,7 +114,6 @@ class OuroborosManagerAgent:
     def compress_context_if_needed(
         self, messages: List[Dict[str, Any]], max_tokens: int
     ) -> List[Dict[str, Any]]:
-        """Hermes/Gemini Task preflight context compaction (>50% window) preserving tool call/result pairs."""
         used = self.estimate_tokens(messages)
         if used <= int(max_tokens * self.config.compression_trigger_ratio):
             return messages
@@ -96,7 +123,6 @@ class OuroborosManagerAgent:
 
         system_msg = messages[0]
         tail_start = max(1, len(messages) - protect_n)
-        # Never split an assistant tool_call from its subsequent tool results
         while tail_start > 1 and messages[tail_start].get("role") == "tool":
             tail_start -= 1
 
@@ -125,7 +151,6 @@ class OuroborosManagerAgent:
                 + "\n\nContinue executing the remaining items in `TASK.md` and emit a complete response."
             ),
         }
-        # Ensure we don't put two 'user' messages in a row if tail[0] is also 'user'
         if tail and tail[0].get("role") == "user":
             tail = [
                 {
@@ -144,9 +169,10 @@ class OuroborosManagerAgent:
         role_override: Optional[str] = None,
         max_turns_override: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Executes the recursive ReAct + Checklist loop until completion or iteration cap."""
         session_id = session_id or f"sess_{uuid.uuid4().hex[:10]}"
-        max_turns = max_turns_override or self.config.max_turns
+        max_turns = max_turns_override or (
+            self.role_policy.max_turns if self.role_policy else self.config.max_turns
+        )
 
         history = self.memory.load_session(session_id)
         if not history:
@@ -165,7 +191,6 @@ class OuroborosManagerAgent:
 
         for turn in range(1, max_turns + 1):
             turns_executed = turn
-            # Refresh system prompt with latest TASK.md, MEMORY.md, and Skill Catalog
             history[0]["content"] = self.build_system_prompt(role_override)
             history = self.compress_context_if_needed(
                 history, self.config.primary_provider.max_context_tokens
@@ -179,8 +204,6 @@ class OuroborosManagerAgent:
 
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
-                # Hermes closed learning loop check: if >=5 tool calls were executed and no skill saved yet,
-                # nudge the agent once to evaluate whether a skill should be persisted.
                 if (
                     total_tool_calls >= self.config.skill_learning_min_tool_calls
                     and not learning_nudge_injected
@@ -203,6 +226,8 @@ class OuroborosManagerAgent:
                 self.memory.save_session(session_id, history, status="completed")
                 return {
                     "session_id": session_id,
+                    "role": self.role_policy.role_name if self.role_policy else "root_manager",
+                    "isolated_workspace": str(self.config.workspace_root),
                     "status": "completed",
                     "turns_executed": turns_executed,
                     "total_tool_calls": total_tool_calls,
@@ -218,6 +243,8 @@ class OuroborosManagerAgent:
         self.memory.save_session(session_id, history, status="budget_exhausted")
         return {
             "session_id": session_id,
+            "role": self.role_policy.role_name if self.role_policy else "root_manager",
+            "isolated_workspace": str(self.config.workspace_root),
             "status": "budget_exhausted",
             "turns_executed": turns_executed,
             "total_tool_calls": total_tool_calls,
@@ -229,28 +256,73 @@ class OuroborosManagerAgent:
         }
 
     def _spawn_child_agent(
-        self, role: str, objective: str, max_turns: int
+        self,
+        role: str,
+        objective: str,
+        max_turns: int,
+        handoff_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Spawns a bounded recursive sub-agent with isolated conversation history."""
+        """Spawns a child sub-agent with a physically isolated workspace, private DB/memory, and RoleSandboxPolicy."""
         if self.recursion_depth >= self.config.max_recursion_depth:
             return {
                 "status": "recursion_limit_reached",
                 "max_recursion_depth": self.config.max_recursion_depth,
                 "message": "Cannot spawn deeper sub-agent; execute remaining steps in current agent.",
             }
+
+        clean_role = role.lower().strip().replace(" ", "_")
+        role_policy = self.role_policies_registry.get(clean_role)
+        role_ws = self.quant_layout.role_workspace(clean_role)
+
+        # Create an isolated AgentConfig pointing to `workspaces/<role>/` so MEMORY.md, TASK.md, and state.db
+        # NEVER pollute the parent or sibling roles!
+        child_primary_provider = dataclasses.replace(self.config.primary_provider)
+        if role_policy and role_policy.model_override:
+            child_primary_provider.model = role_policy.model_override
+
+        child_config = dataclasses.replace(
+            self.config,
+            workspace_root=role_ws,
+            primary_provider=child_primary_provider,
+        )
+
+        handoff_path: Optional[pathlib.Path] = None
+        if handoff_payload is not None:
+            packet_id = f"handoff_to_{clean_role}_{uuid.uuid4().hex[:6]}"
+            handoff_path = self.quant_layout.write_handoff_packet(packet_id, handoff_payload)
+
         child = OuroborosManagerAgent(
-            config=self.config,
+            config=child_config,
             llm_callable=self.llm_callable,
             recursion_depth=self.recursion_depth + 1,
+            approval_callback=self.tools.approval_callback,
+            role_policy=role_policy,
+            shared_root=self.shared_root,
+            role_policies_registry=self.role_policies_registry,
+        )
+
+        full_objective = objective
+        if handoff_payload is not None and handoff_path is not None:
+            full_objective += (
+                f"\n\n## Structured Handoff Packet (`{handoff_path.name}`)\n"
+                f"```json\n{json.dumps(handoff_payload, indent=2, sort_keys=True)}\n```"
+            )
+
+        effective_turns = min(
+            max_turns,
+            role_policy.max_turns if role_policy else self.config.subagent_max_turns,
         )
         result = child.run_task(
-            user_prompt=objective,
-            session_id=f"sub_{role.lower().replace(' ', '_')}_{uuid.uuid4().hex[:6]}",
-            role_override=role,
-            max_turns_override=min(max_turns, self.config.subagent_max_turns),
+            user_prompt=full_objective,
+            session_id=f"sub_{clean_role}_{uuid.uuid4().hex[:6]}",
+            role_override=clean_role,
+            max_turns_override=effective_turns,
         )
         return {
-            "subagent_role": role,
+            "subagent_role": clean_role,
+            "isolated_workspace": str(role_ws),
+            "enforced_policy": dataclasses.asdict(role_policy) if role_policy else None,
+            "handoff_packet_path": str(handoff_path) if handoff_path else None,
             "status": result["status"],
             "turns_executed": result["turns_executed"],
             "summary": result["final_response"],
