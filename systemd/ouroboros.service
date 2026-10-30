@@ -1,0 +1,17 @@
+[Unit]
+Description=Ouroboros Recursive Autonomous Manager Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ouroboros
+WorkingDirectory=/opt/ouroboros-agent
+EnvironmentFile=/opt/ouroboros-agent/.env
+ExecStart=/usr/bin/python3 /opt/ouroboros-agent/main.py --mode daemon --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

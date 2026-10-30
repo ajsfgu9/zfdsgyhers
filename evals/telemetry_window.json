@@ -1,0 +1,14 @@
+{
+  "window_days": 7,
+  "merged_prs_7d": 50,
+  "reverted_prs_7d": 0,
+  "baseline_30d_revert_rate": 0.015,
+  "sev1_sev2_escapes_from_tier0_tier1": 0,
+  "mean_rounds_to_pass": 1.25,
+  "max_pr_rounds_observed": 2,
+  "module_hotfixes_14d": {
+    "ouroboros/loop.py": 1,
+    "ouroboros/tools.py": 0,
+    "ouroboros/skills.py": 0
+  }
+}
