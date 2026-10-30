@@ -1,4 +1,4 @@
-"""Core Recursive Manager Loop with Role-Separated Multi-Agent Isolation (v0.2.0)."""
+"""Core Recursive Manager Loop with Role-Separated Multi-Agent Isolation, Telegram, & Zero-Downtime Hot-Reload (v0.3.0)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import AgentConfig, ModelProviderConfig
+from ouroboros.hot_reload import HotReloadSupervisor
 from ouroboros.memory import MemoryAndStateStore
 from ouroboros.multi_agent import (
     QuantDeskLayout,
@@ -18,6 +19,7 @@ from ouroboros.multi_agent import (
     build_quant_desk_policies,
 )
 from ouroboros.skills import SkillRegistry
+from ouroboros.telegram import TelegramBotService
 from ouroboros.tools import ServerToolRegistry
 
 
@@ -25,7 +27,7 @@ LLMCallable = Callable[[List[Dict[str, Any]], List[Dict[str, Any]], ModelProvide
 
 
 class OuroborosManagerAgent:
-    """Recursive Autonomous Manager Agent with role-isolated sub-agents and data-pollution firewalls."""
+    """Recursive Autonomous Manager Agent with role-isolated sub-agents, Telegram, and live hot-reloading."""
 
     def __init__(
         self,
@@ -60,6 +62,12 @@ class OuroborosManagerAgent:
             role_policy=self.role_policy,
             shared_root=self.shared_root,
         )
+        self.hot_reload = HotReloadSupervisor(plugins_dir=self.config.plugins_dir)
+        self.telegram = TelegramBotService(agent=self)
+        self.tools.telegram_service = self.telegram
+        self.tools.hot_reload_callback = lambda: self.hot_reload.sync_all(self, force=True)
+        # Initial plugin & .env sync
+        self.hot_reload.sync_all(self, force=True)
 
     def build_system_prompt(self, role_override: Optional[str] = None) -> str:
         soul = self.memory.read_soul().strip()
@@ -90,7 +98,9 @@ class OuroborosManagerAgent:
             "2. Check Available Skills and call `lookup_skills` before writing custom code.\n"
             "3. Emit independent tool calls in the same turn for parallel execution.\n"
             "4. For multi-agent workflows (such as `@quant-research-lead`), delegate to isolated specialist roles "
-            "(`librarian`, `scout`, `sweeper`, `skeptic`) via `delegate_subagent` with a structured `handoff_payload`.\n\n"
+            "(`librarian`, `scout`, `sweeper`, `skeptic`) via `delegate_subagent` with a structured `handoff_payload`.\n"
+            "5. Zero-Downtime Evolution: New tools dropped into `plugins/*.py`, skills in `skills/*/SKILL.md`, "
+            "and `.env` updates are hot-reloaded automatically on every turn without restarting the daemon.\n\n"
             f"## Active Milestone Checklist (`TASK.md`)\n{task_text}\n\n"
             f"## Private Role Memory (`MEMORY.md`)\n{memory_text}\n\n"
             f"## Available On-Demand Skills (`SKILL.md` Catalog)\n{skill_catalog}\n"
@@ -169,6 +179,9 @@ class OuroborosManagerAgent:
         role_override: Optional[str] = None,
         max_turns_override: Optional[int] = None,
     ) -> Dict[str, Any]:
+        # Hot-reload .env, skills/, plugins/*.py, and modified core modules before starting task!
+        self.hot_reload.sync_all(self, force=False)
+
         session_id = session_id or f"sess_{uuid.uuid4().hex[:10]}"
         max_turns = max_turns_override or (
             self.role_policy.max_turns if self.role_policy else self.config.max_turns
@@ -191,6 +204,8 @@ class OuroborosManagerAgent:
 
         for turn in range(1, max_turns + 1):
             turns_executed = turn
+            # Check for live .env, skill, or plugin updates between turns too!
+            self.hot_reload.sync_all(self, force=False)
             history[0]["content"] = self.build_system_prompt(role_override)
             history = self.compress_context_if_needed(
                 history, self.config.primary_provider.max_context_tokens
@@ -262,7 +277,6 @@ class OuroborosManagerAgent:
         max_turns: int,
         handoff_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Spawns a child sub-agent with a physically isolated workspace, private DB/memory, and RoleSandboxPolicy."""
         if self.recursion_depth >= self.config.max_recursion_depth:
             return {
                 "status": "recursion_limit_reached",
@@ -274,8 +288,6 @@ class OuroborosManagerAgent:
         role_policy = self.role_policies_registry.get(clean_role)
         role_ws = self.quant_layout.role_workspace(clean_role)
 
-        # Create an isolated AgentConfig pointing to `workspaces/<role>/` so MEMORY.md, TASK.md, and state.db
-        # NEVER pollute the parent or sibling roles!
         child_primary_provider = dataclasses.replace(self.config.primary_provider)
         if role_policy and role_policy.model_override:
             child_primary_provider.model = role_policy.model_override

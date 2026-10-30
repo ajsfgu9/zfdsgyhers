@@ -1,4 +1,4 @@
-"""Three-tier persistent memory, Gemini-Task checklist state machine, and SQLite session store."""
+"""Three-tier persistent memory, Gemini-Task checklist state machine, and SQLite WAL store."""
 
 from __future__ import annotations
 
@@ -12,14 +12,14 @@ from typing import Any, Dict, List, Optional
 DEFAULT_SOUL = """# SOUL.md — Core Agent Identity & Operating Invariants
 You are Ouroboros, a recursive autonomous manager agent living on a dedicated server.
 1. Act as a chief-of-staff and builder: decompose complex goals into verifiable milestones in TASK.md before executing.
-2. Prefer delegating isolated sub-tasks to specialist skills or git-worktree sub-agents rather than polluting the root context.
+2. Prefer delegating isolated sub-tasks to specialist skills or isolated sub-agents rather than polluting the root context.
 3. Never fabricate command outputs, test results, or URLs. Verify every mutation with a deterministic check.
 4. Respect Sentinel Tier-2 boundaries: halt and request human confirmation before modifying sensitive auth, firewall, or governance files.
 """
 
 
 class MemoryAndStateStore:
-    """Manages SOUL.md, MEMORY.md, TASK.md, and SQLite WAL session persistence."""
+    """Manages SOUL.md, MEMORY.md, TASK.md, and SQLite WAL session + key-value persistence."""
 
     def __init__(self, workspace_root: pathlib.Path) -> None:
         self.workspace_root = workspace_root
@@ -70,6 +70,37 @@ class MemoryAndStateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kv_store (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT,
+                    updated_at REAL
+                )
+                """
+            )
+
+    def set_kv(self, key: str, value: Any) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO kv_store (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, json.dumps(value, ensure_ascii=False), time.time()),
+            )
+
+    def get_kv(self, key: str, default: Any = None) -> Any:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT value_json FROM kv_store WHERE key = ?", (key,)
+            ).fetchone()
+            if not row:
+                return default
+            return json.loads(row[0])
 
     def read_soul(self) -> str:
         return self.soul_path.read_text(encoding="utf-8")

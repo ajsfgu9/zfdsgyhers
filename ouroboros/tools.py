@@ -8,6 +8,7 @@ import json
 import pathlib
 import subprocess
 import time
+import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import AgentConfig
@@ -315,6 +316,37 @@ class ServerToolRegistry:
             )
         )
 
+
+        self.register(
+            ToolSpec(
+                name="telegram_notify",
+                description="Send a proactive message or report to the user on Telegram.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "Message text to send."},
+                        "chat_id": {"type": "string", "description": "Optional target chat_id override."},
+                    },
+                    "required": ["message"],
+                },
+                handler=self._handle_telegram_notify,
+                default_risk_tier="Tier 0",
+            )
+        )
+
+        self.register(
+            ToolSpec(
+                name="hot_reload_runtime",
+                description=(
+                    "Hot-reload .env variables, skills/*/SKILL.md, plugins/*.py custom tools, and "
+                    "modified core modules in-place without restarting the daemon or losing state."
+                ),
+                parameters={"type": "object", "properties": {}},
+                handler=self._handle_hot_reload_runtime,
+                default_risk_tier="Tier 0",
+            )
+        )
+
         self.register(
             ToolSpec(
                 name="delegate_subagent",
@@ -344,6 +376,32 @@ class ServerToolRegistry:
                 },
                 handler=self._handle_delegate_subagent,
                 default_risk_tier="Tier 1",
+            )
+        )
+
+        self.register(
+            ToolSpec(
+                name="telegram_send",
+                description=(
+                    "Send a notification or command output message directly to an authorized Telegram chat "
+                    "via the configured Telegram Bot API."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Message text to send to the user on Telegram.",
+                        },
+                        "chat_id": {
+                            "type": "integer",
+                            "description": "Optional target Telegram chat_id (defaults to first allowed chat ID in .env).",
+                        },
+                    },
+                    "required": ["text"],
+                },
+                handler=self._handle_telegram_send,
+                default_risk_tier="Tier 0",
             )
         )
 
@@ -470,3 +528,53 @@ class ServerToolRegistry:
         max_turns = int(args.get("max_turns", self.config.subagent_max_turns))
         handoff_payload = args.get("handoff_payload")
         return self.subagent_spawner(role, objective, max_turns, handoff_payload)
+
+    def _handle_telegram_send(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        token = self.config.telegram_bot_token
+        if not token:
+            return {
+                "error": "OUROBOROS_TELEGRAM_BOT_TOKEN is not set in environment or .env."
+            }
+        target_chat_id = args.get("chat_id")
+        if target_chat_id is None:
+            if not self.config.telegram_allowed_chat_ids:
+                return {
+                    "error": "No chat_id provided and OUROBOROS_TELEGRAM_ALLOWED_CHAT_IDS is empty."
+                }
+            target_chat_id = self.config.telegram_allowed_chat_ids[0]
+        target_chat_id = int(target_chat_id)
+        if (
+            self.config.telegram_allowed_chat_ids
+            and target_chat_id not in self.config.telegram_allowed_chat_ids
+        ):
+            return {
+                "error": f"chat_id {target_chat_id} is not in OUROBOROS_TELEGRAM_ALLOWED_CHAT_IDS."
+            }
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return {"error": "Message text cannot be empty."}
+
+        url = f"{self.config.telegram_api_base}/bot{token}/sendMessage"
+        payload = json.dumps({"chat_id": target_chat_id, "text": text[:4000]}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return {"status": "sent", "chat_id": target_chat_id, "telegram_ok": body.get("ok", False)}
+
+
+    def _handle_telegram_notify(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        tg = getattr(self, "telegram_service", None)
+        if not tg:
+            return {"error": "Telegram service is not attached to this tool registry."}
+        return tg.send_message(args["message"], chat_id=args.get("chat_id"))
+
+    def _handle_hot_reload_runtime(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        reloader = getattr(self, "hot_reload_callback", None)
+        if not reloader:
+            return {"error": "Hot-reload callback is not attached."}
+        return reloader()
