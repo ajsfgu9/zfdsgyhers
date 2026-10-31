@@ -1,4 +1,4 @@
-"""Dedicated Server Tool Registry, Role Sandbox Firewall, Sentinel Risk Classifier, and Parallel Executor."""
+"""Dedicated Server Tool Registry, Role Sandbox Firewall, Zombie Process Reaper, and Parallel Executor (v0.4.0)."""
 
 from __future__ import annotations
 
@@ -48,11 +48,23 @@ class ServerToolRegistry:
         self.role_policy = role_policy
         self.shared_root = (shared_root or config.workspace_root).resolve()
         self._tools: Dict[str, ToolSpec] = {}
+        self._cached_schemas: Optional[List[Dict[str, Any]]] = None
         self._background_procs: Dict[str, subprocess.Popen[str]] = {}
         self._register_builtin_tools()
 
     def register(self, spec: ToolSpec) -> None:
         self._tools[spec.name] = spec
+        self._cached_schemas = None
+
+    def reap_background_procs(self) -> Dict[str, int]:
+        """Reaps completed background child processes so zombie (`<defunct>`) entries never accumulate."""
+        reaped: Dict[str, int] = {}
+        for tid, proc in list(self._background_procs.items()):
+            rc = proc.poll()
+            if rc is not None:
+                reaped[tid] = rc
+                del self._background_procs[tid]
+        return reaped
 
     def classify_risk_tier(self, tool_name: str, args: Dict[str, Any]) -> str:
         serialized = json.dumps(args, sort_keys=True)
@@ -69,6 +81,8 @@ class ServerToolRegistry:
         return spec.default_risk_tier
 
     def get_openai_tool_schemas(self) -> List[Dict[str, Any]]:
+        if self._cached_schemas is not None:
+            return self._cached_schemas
         schemas = []
         for spec in self._tools.values():
             schemas.append(
@@ -81,11 +95,13 @@ class ServerToolRegistry:
                     },
                 }
             )
+        self._cached_schemas = schemas
         return schemas
 
     def execute_tool_calls(
         self, session_id: str, tool_calls: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
+        self.reap_background_procs()
         if not tool_calls:
             return []
 
@@ -316,7 +332,6 @@ class ServerToolRegistry:
             )
         )
 
-
         self.register(
             ToolSpec(
                 name="telegram_notify",
@@ -338,8 +353,8 @@ class ServerToolRegistry:
             ToolSpec(
                 name="hot_reload_runtime",
                 description=(
-                    "Hot-reload .env variables, skills/*/SKILL.md, plugins/*.py custom tools, and "
-                    "modified core modules in-place without restarting the daemon or losing state."
+                    "Synchronize .env variables, skills/*/SKILL.md, and plugins/*.py atomically, "
+                    "and preflight-verify modified core modules."
                 ),
                 parameters={"type": "object", "properties": {}},
                 handler=self._handle_hot_reload_runtime,
@@ -536,17 +551,14 @@ class ServerToolRegistry:
                 "error": "OUROBOROS_TELEGRAM_BOT_TOKEN is not set in environment or .env."
             }
         target_chat_id = args.get("chat_id")
+        allowed_strs = [str(x).strip() for x in self.config.telegram_allowed_chat_ids]
         if target_chat_id is None:
-            if not self.config.telegram_allowed_chat_ids:
+            if not allowed_strs:
                 return {
                     "error": "No chat_id provided and OUROBOROS_TELEGRAM_ALLOWED_CHAT_IDS is empty."
                 }
-            target_chat_id = self.config.telegram_allowed_chat_ids[0]
-        target_chat_id = int(target_chat_id)
-        if (
-            self.config.telegram_allowed_chat_ids
-            and target_chat_id not in self.config.telegram_allowed_chat_ids
-        ):
+            target_chat_id = allowed_strs[0]
+        if allowed_strs and str(target_chat_id).strip() not in allowed_strs:
             return {
                 "error": f"chat_id {target_chat_id} is not in OUROBOROS_TELEGRAM_ALLOWED_CHAT_IDS."
             }
@@ -555,7 +567,7 @@ class ServerToolRegistry:
             return {"error": "Message text cannot be empty."}
 
         url = f"{self.config.telegram_api_base}/bot{token}/sendMessage"
-        payload = json.dumps({"chat_id": target_chat_id, "text": text[:4000]}).encode("utf-8")
+        payload = json.dumps({"chat_id": int(str(target_chat_id).strip()), "text": text[:4000]}).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=payload,
@@ -566,12 +578,11 @@ class ServerToolRegistry:
             body = json.loads(resp.read().decode("utf-8"))
         return {"status": "sent", "chat_id": target_chat_id, "telegram_ok": body.get("ok", False)}
 
-
     def _handle_telegram_notify(self, args: Dict[str, Any]) -> Dict[str, Any]:
         tg = getattr(self, "telegram_service", None)
         if not tg:
             return {"error": "Telegram service is not attached to this tool registry."}
-        return tg.send_message(args["message"], chat_id=args.get("chat_id"))
+        return tg.send_message(args.get("chat_id") or (tg.allowed_chat_ids[0] if tg.allowed_chat_ids else ""), args["message"])
 
     def _handle_hot_reload_runtime(self, args: Dict[str, Any]) -> Dict[str, Any]:
         reloader = getattr(self, "hot_reload_callback", None)

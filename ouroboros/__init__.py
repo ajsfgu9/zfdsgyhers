@@ -1,3 +1,3 @@
-"""Ouroboros: Recursive Autonomous Manager Agent (v0.3.0 Evergreen Zero-Downtime Edition)."""
+"""Ouroboros: Recursive Autonomous Manager Agent (v0.4.0 Industrial Hardened Edition)."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

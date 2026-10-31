@@ -623,5 +623,55 @@ class TestOuroborosAgentAndGovernance(unittest.TestCase):
         self.assertIn("custom_ping", agent.tools._tools)
 
 
+
+    def test_industrial_cache_atomic_plugin_swap_glob_firewall_and_logger(self) -> None:
+        """Verifies v0.4.0 Multi-Tier Cache hit rates, Prompt-Prefix alignment, Atomic Plugin Swap (including deletion), Glob Firewall, and Rotating Logger."""
+        agent = OuroborosManagerAgent(config=self.config)
+
+        # 1. Prompt-Prefix Cache Alignment: Static Skill Catalog must precede volatile TASK.md checklist
+        prompt1 = agent.build_system_prompt()
+        prompt2 = agent.build_system_prompt()
+        self.assertEqual(prompt1, prompt2)
+        self.assertLess(
+            prompt1.index("Available On-Demand Skills"),
+            prompt1.index("Active Milestone Checklist"),
+        )
+        metrics = agent.memory.cache_metrics()
+        self.assertGreaterEqual(metrics["file_cache"]["hits"], 3)
+        self.assertGreaterEqual(agent.skills.cache_hits, 1)
+
+        # 2. Hardened Glob & Path-Normalization Firewall on RoleSandboxPolicy
+        sweeper_policy = agent.role_policies_registry["sweeper"]
+        self.assertIsNotNone(sweeper_policy.check_bash_command("cat data/hold*/*.csv"))
+        self.assertIsNotNone(sweeper_policy.check_bash_command("cat data//holdout/oos.csv"))
+        self.assertIsNotNone(sweeper_policy.check_bash_command("cd data && head holdout/oos.csv"))
+
+        # 3. Atomic Plugin Registry Swap: when a plugin file is deleted, its tools are removed (no ghost tools)
+        self.config.plugins_dir = self.root / "plugins_atomic"
+        self.config.plugins_dir.mkdir(parents=True, exist_ok=True)
+        agent.hot_reload.plugins_dir = self.config.plugins_dir
+        pfile = self.config.plugins_dir / "ephemeral_tool.py"
+        pfile.write_text(
+            "from ouroboros.tools import ToolSpec\n"
+            "def register_plugins(reg):\n"
+            "    reg.register(ToolSpec(name='temp_alpha', description='t', parameters={'type':'object','properties':{}}, handler=lambda a: {'ok':1}))\n",
+            encoding="utf-8",
+        )
+        agent.hot_reload.sync_all(agent, force=False)
+        self.assertIn("temp_alpha", agent.tools._tools)
+
+        # Delete the plugin file and sync: temp_alpha must be unregistered!
+        pfile.unlink()
+        agent.hot_reload.sync_all(agent, force=False)
+        self.assertNotIn("temp_alpha", agent.tools._tools)
+
+        # 4. Preflight-verified graceful_reexec dry-run and Rotating Logger (/logs)
+        reexec_check = agent.hot_reload.graceful_reexec(agent, dry_run=True)
+        self.assertEqual(reexec_check["status"], "ready_for_execv")
+        agent.logger.info("adversarial_audit_verified", round=2)
+        tail_lines = agent.logger.tail(lines=10)
+        self.assertTrue(any("adversarial_audit_verified" in line for line in tail_lines))
+
+
 if __name__ == "__main__":
     unittest.main()

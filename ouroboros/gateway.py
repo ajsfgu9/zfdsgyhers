@@ -1,4 +1,4 @@
-"""Event-Driven HTTP Gateway, Telegram Bot Poller/Webhook, & Zero-Downtime Hot-Reload Control Plane (v0.3.0)."""
+"""Event-Driven HTTP Gateway, Telegram Bot Poller/Webhook, & Industrial Reload Control Plane (v0.4.0)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import signal
 import threading
 import time
+import urllib.parse
 from typing import Dict, List, Optional
 
 from ouroboros.loop import OuroborosManagerAgent
@@ -23,7 +24,7 @@ class ScheduledRoutine:
 
 
 class OuroborosGatewayServer:
-    """Single-process hub exposing REST `/v1/tasks`, `/v1/reload`, `/v1/telegram/webhook`, and background polling."""
+    """Single-process hub exposing REST `/v1/tasks`, `/v1/logs`, `/v1/reload`, `/v1/reexec`, and Telegram polling."""
 
     def __init__(
         self,
@@ -40,16 +41,27 @@ class OuroborosGatewayServer:
         self.enable_telegram_polling = enable_telegram_polling
         self.telegram: TelegramBotBridge = agent.telegram
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()
+        self._lock = agent.execution_lock
 
     def install_signal_handlers(self) -> None:
-        """Allows `kill -HUP <pid>` or `systemctl reload ouroboros` to trigger a zero-downtime hot-reload."""
+        """
+        - `SIGHUP` (`systemctl reload ouroboros`): Synchronizes `.env`, `skills/`, and `plugins/*.py` atomically.
+        - `SIGUSR2`: Performs a full preflight-verified transactional drain + `os.execv` binary re-exec.
+        """
         if hasattr(signal, "SIGHUP"):
             def _on_sighup(signum: int, frame: object) -> None:
                 with self._lock:
                     self.agent.hot_reload.sync_all(self.agent, force=True)
             try:
                 signal.signal(signal.SIGHUP, _on_sighup)
+            except ValueError:
+                pass
+
+        if hasattr(signal, "SIGUSR2"):
+            def _on_sigusr2(signum: int, frame: object) -> None:
+                self.agent.hot_reload.graceful_reexec(self.agent, dry_run=False)
+            try:
+                signal.signal(signal.SIGUSR2, _on_sigusr2)
             except ValueError:
                 pass
 
@@ -69,6 +81,7 @@ class OuroborosGatewayServer:
 
     def serve_forever(self) -> None:
         self.install_signal_handlers()
+        self.agent.logger.info("gateway_started", host=self.host, port=self.port)
         if self.enable_telegram_polling:
             self.telegram.start_background_polling()
 
@@ -76,13 +89,14 @@ class OuroborosGatewayServer:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if self.path == "/healthz":
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/healthz":
                     gateway.agent.hot_reload.sync_all(gateway.agent, force=False)
                     self._send_json(
                         200,
                         {
                             "status": "ok",
-                            "version": "0.3.0",
+                            "version": "0.4.0",
                             "service": "ouroboros-gateway",
                             "telegram_configured": bool(gateway.telegram.is_configured),
                             "telegram_bot_username": gateway.telegram.bot_username,
@@ -91,10 +105,26 @@ class OuroborosGatewayServer:
                             "loaded_env_files": gateway.agent.config._env_loader.last_loaded_files,
                             "active_skills_count": len(gateway.agent.skills._skills),
                             "active_plugins": gateway.agent.hot_reload.loaded_plugins,
+                            "pending_core_reexec_files": gateway.agent.hot_reload.pending_core_reexec_files,
+                            "log_file_path": str(gateway.agent.logger.log_file),
+                            "cache_metrics": gateway.agent.memory.cache_metrics(),
                         },
                     )
                     return
-                if self.path == "/v1/state":
+
+                if parsed.path == "/v1/logs":
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    lines = int(qs.get("lines", ["50"])[0])
+                    self._send_json(
+                        200,
+                        {
+                            "log_file": str(gateway.agent.logger.log_file),
+                            "lines": gateway.agent.logger.tail(lines=lines),
+                        },
+                    )
+                    return
+
+                if parsed.path == "/v1/state":
                     gateway.agent.hot_reload.sync_all(gateway.agent, force=False)
                     self._send_json(
                         200,
@@ -103,6 +133,7 @@ class OuroborosGatewayServer:
                             "skills": gateway.agent.skills.list_catalog_prompt(),
                             "tools": sorted(gateway.agent.tools._tools.keys()),
                             "plugins": gateway.agent.hot_reload.loaded_plugins,
+                            "cache_metrics": gateway.agent.memory.cache_metrics(),
                             "telegram_configured": bool(gateway.telegram.is_configured),
                         },
                     )
@@ -114,6 +145,11 @@ class OuroborosGatewayServer:
                     with gateway._lock:
                         report = gateway.agent.hot_reload.sync_all(gateway.agent, force=True)
                     self._send_json(200, {"status": "reloaded", "report": report})
+                    return
+
+                if self.path == "/v1/reexec":
+                    self._send_json(200, {"status": "reexec_initiated"})
+                    gateway.agent.hot_reload.graceful_reexec(gateway.agent, dry_run=False)
                     return
 
                 if self.path == "/v1/telegram/webhook":
@@ -149,7 +185,7 @@ class OuroborosGatewayServer:
                 self.wfile.write(raw)
 
             def log_message(self, format: str, *args: object) -> None:
-                return
+                gateway.agent.logger.info("http_request", path=self.path, method=self.command)
 
         httpd = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
         httpd.serve_forever()

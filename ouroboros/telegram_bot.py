@@ -360,6 +360,28 @@ class TelegramBotBridge:
             self.send_message(chat_id, reply, reply_to_message_id=message_id)
             return reply
 
+
+        if cmd_lower == "/logs":
+            n_lines = int(cmd_arg) if cmd_arg.isdigit() else 25
+            recent = self.agent.logger.tail(lines=n_lines) if hasattr(self.agent, "logger") else []
+            log_path = str(self.agent.logger.log_file) if hasattr(self.agent, "logger") else "N/A"
+            reply = (
+                f"📜 Recent Server Logs ({log_path}):\n"
+                + ("\n".join(recent) if recent else "(no log entries yet)")
+            )
+            self.send_message(chat_id, reply, reply_to_message_id=message_id)
+            return reply
+
+        if cmd_lower == "/reexec":
+            check = self.agent.hot_reload.graceful_reexec(self.agent, dry_run=True)
+            if check.get("status") != "ready_for_execv":
+                reply = f"⚠️ Preflight check blocked re-exec:\n{check.get('error')}"
+                self.send_message(chat_id, reply, reply_to_message_id=message_id)
+                return reply
+            reply = f"🚀 Preflight passed (PID {check.get('pid')}). Performing zero-downtime os.execv binary upgrade..."
+            self.send_message(chat_id, reply, reply_to_message_id=message_id)
+            return reply
+
         if cmd_lower == "/tools":
             tool_names = sorted(self.agent.tools._tools.keys())
             reply = f"Registered Tools ({len(tool_names)}):\n- " + "\n- ".join(tool_names)

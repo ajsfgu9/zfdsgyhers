@@ -1,4 +1,4 @@
-"""Dynamic Skill Registry and Hermes-style Closed Learning Loop (`SKILL.md`)."""
+"""Mtime-Cached Dynamic Skill Registry and Hermes-style Closed Learning Loop (`SKILL.md`)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import dataclasses
 import os
 import pathlib
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
@@ -23,7 +23,7 @@ class SkillMetadata:
 
 
 class SkillRegistry:
-    """Discovers, loads, and dynamically saves reusable `SKILL.md` capabilities."""
+    """Discovers, caches by `st_mtime_ns`, and dynamically saves reusable `SKILL.md` capabilities."""
 
     def __init__(self, skills_dir: pathlib.Path) -> None:
         self.skills_dir = skills_dir
@@ -32,23 +32,52 @@ class SkillRegistry:
         except PermissionError:
             pass
         self._skills: Dict[str, SkillMetadata] = {}
-        self.reload()
+        self._last_snapshot_sig: Optional[Tuple[Tuple[str, int], ...]] = None
+        self._cached_catalog_prompt: str = "No custom skills installed yet."
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
+        self.reload(force=True)
 
     def is_writable(self) -> bool:
-        """Checks whether the current Linux service user has write permission on skills_dir."""
         return os.access(self.skills_dir, os.W_OK)
 
-    def reload(self) -> None:
-        self._skills.clear()
+    def _compute_dir_signature(self) -> Tuple[Tuple[str, int], ...]:
         if not self.skills_dir.exists():
-            return
+            return ()
+        sig = []
         for skill_md in sorted(self.skills_dir.glob("*/SKILL.md")):
+            try:
+                sig.append((str(skill_md), skill_md.stat().st_mtime_ns))
+            except OSError:
+                continue
+        return tuple(sig)
+
+    def reload(self, force: bool = False) -> bool:
+        """Re-parses `SKILL.md` files ONLY if a file was added, removed, or modified on disk."""
+        current_sig = self._compute_dir_signature()
+        if not force and self._last_snapshot_sig == current_sig:
+            self.cache_hits += 1
+            return False
+
+        self.cache_misses += 1
+        self._last_snapshot_sig = current_sig
+        self._skills.clear()
+        for path_str, _ in current_sig:
+            skill_md = pathlib.Path(path_str)
             try:
                 meta = self._parse_skill_md(skill_md)
             except OSError:
                 continue
             if meta and meta.enabled:
                 self._skills[meta.name.lower()] = meta
+
+        if not self._skills:
+            self._cached_catalog_prompt = "No custom skills installed yet."
+        else:
+            self._cached_catalog_prompt = "\n".join(
+                f"- **{meta.name}**: {meta.description}" for meta in self._skills.values()
+            )
+        return True
 
     def _parse_skill_md(self, path: pathlib.Path) -> Optional[SkillMetadata]:
         raw = path.read_text(encoding="utf-8")
@@ -84,25 +113,18 @@ class SkillRegistry:
         )
 
     def list_catalog_prompt(self) -> str:
-        """Returns compact skill descriptions for system prompt injection (Gemini Task / OpenClaw style)."""
-        self.reload()
-        if not self._skills:
-            return "No custom skills installed yet."
-        lines = []
-        for meta in self._skills.values():
-            lines.append(f"- **{meta.name}**: {meta.description}")
-        return "\n".join(lines)
+        """Returns cached compact skill descriptions for system prompt injection."""
+        self.reload(force=False)
+        return self._cached_catalog_prompt
 
     def lookup_skills(self, skill_names: List[str]) -> Dict[str, Any]:
-        """Loads full SKILL.md instructions on demand without bloating initial context."""
-        self.reload()
+        self.reload(force=False)
         found = []
         missing = []
         for requested in skill_names:
             clean = requested.lower().replace("user:", "").replace("system:", "").strip()
             meta = self._skills.get(clean)
             if not meta:
-                # Substring fallback matching per Gemini Task skill resolution
                 candidates = [
                     m
                     for k, m in self._skills.items()
@@ -124,7 +146,7 @@ class SkillRegistry:
         return {"loaded_skills": found, "not_found": missing}
 
     def get_skill_resources(self, skill_name: str, filenames: List[str]) -> Dict[str, str]:
-        self.reload()
+        self.reload(force=False)
         clean = skill_name.lower().replace("user:", "").replace("system:", "").strip()
         meta = self._skills.get(clean)
         if not meta:
@@ -146,7 +168,6 @@ class SkillRegistry:
         scripts: Optional[Dict[str, str]] = None,
         overwrite: bool = False,
     ) -> Dict[str, Any]:
-        """Saves or updates a reusable skill (Hermes closed learning loop)."""
         slug = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-")
         target_dir = self.skills_dir / slug
         if target_dir.exists() and not overwrite:
@@ -181,5 +202,5 @@ class SkillRegistry:
                     f"Fix on host: sudo chown -R $(id -un):$(id -gn) {self.skills_dir} && sudo chmod -R u+rwX {self.skills_dir}"
                 ),
             }
-        self.reload()
+        self.reload(force=True)
         return {"status": "created", "name": slug, "path": str(target_dir)}

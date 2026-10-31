@@ -1,19 +1,11 @@
-"""Strict Role-Separated Multi-Agent Isolation Engine & 5-Role Quant Desk Orchestrator.
-
-Prevents data pollution across sub-agents via four physical barriers:
-1. Isolated Role Workspaces (`workspaces/<role>/` with private `MEMORY.md`, `TASK.md`, and `state.db`)
-2. Data-Wall Path ACLs (`denied_path_prefixes` + `writable_path_prefixes` enforced on `file_ops` and `host_bash`)
-3. Role-Scoped Skill Whitelists (`allowed_skills` so a Scout cannot invoke Skeptic or Librarian write tools)
-4. Structured JSON Artifact Handoffs (sub-agents communicate only via schema-validated JSON packets in `handoffs/`,
-   never by sharing raw conversation history or narrative prose)
-"""
+"""Strict Role-Separated Multi-Agent Isolation Engine & 5-Role Quant Desk Orchestrator (v0.4.0 Hardened)."""
 
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import pathlib
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -30,12 +22,10 @@ class RoleSandboxPolicy:
     max_turns: int = 25
 
     def check_path_access(self, target_path: pathlib.Path, mode: str, shared_root: pathlib.Path) -> Optional[str]:
-        """Returns an error string if access violates the role's data-pollution firewall, or None if allowed."""
         resolved = target_path.resolve()
         try:
             rel = resolved.relative_to(shared_root.resolve()).as_posix()
         except ValueError:
-            # Outside shared_root: allow if inside the role's own isolated workspace
             return None
 
         for denied in self.denied_path_prefixes:
@@ -57,18 +47,27 @@ class RoleSandboxPolicy:
         return None
 
     def check_bash_command(self, command: str) -> Optional[str]:
-        """Blocks shell commands that attempt to read or touch denied data slices (e.g., Holdout snooping)."""
+        """Blocks shell commands that attempt to read or touch denied data slices (including glob/symlink tricks)."""
+        normalized = re.sub(r"/+", "/", command)
         for denied in self.denied_path_prefixes:
             clean_denied = denied.strip("/")
-            if clean_denied and clean_denied in command:
+            if not clean_denied:
+                continue
+            leaf = clean_denied.rsplit("/", 1)[-1]
+            wildcard_prefix = leaf[:4] + "*" if len(leaf) >= 4 else leaf
+            if (
+                clean_denied in normalized
+                or re.search(rf"\b{re.escape(leaf)}\b", normalized)
+                or (len(leaf) >= 4 and wildcard_prefix in normalized)
+            ):
                 return (
                     f"[DATA_POLLUTION_FIREWALL] Role '{self.role_name}' bash command blocked: "
-                    f"references forbidden path '{clean_denied}'."
+                    f"references forbidden path or pattern '{clean_denied}'."
                 )
         for ro in self.readonly_path_prefixes:
             clean_ro = ro.strip("/")
-            if clean_ro and clean_ro in command:
-                if any(op in command for op in (">", "tee ", "rm ", "mv ", "cp ", "sed -i", "append")):
+            if clean_ro and clean_ro in normalized:
+                if any(op in normalized for op in (">", "tee ", "rm ", "mv ", "cp ", "sed -i", "append", "dd ")):
                     return (
                         f"[DATA_POLLUTION_FIREWALL] Role '{self.role_name}' bash command blocked: "
                         f"attempts to mutate read-only path '{clean_ro}'."
@@ -80,13 +79,12 @@ def build_quant_desk_policies(
     frontier_model: Optional[str] = None,
     fast_model: Optional[str] = None,
 ) -> Dict[str, RoleSandboxPolicy]:
-    """Returns the 5 strictly isolated role policies required by @quant-research-lead."""
     return {
         "lead": RoleSandboxPolicy(
             role_name="lead",
             description="Orchestrates the 8-gate pipeline across Librarian, Scout, Sweeper, and Skeptic without grading its own homework.",
             allowed_skills=["quant-research-lead", "ai-quant-research-desk"],
-            denied_path_prefixes=["data/holdout"],  # Lead never tunes on holdout directly
+            denied_path_prefixes=["data/holdout"],
             readonly_path_prefixes=["ledger", "data/develop", "data/select"],
             model_override=frontier_model,
             max_turns=40,
@@ -122,7 +120,7 @@ def build_quant_desk_policies(
             role_name="skeptic",
             description="Adversarial falsifier running on the strongest reasoning model. Only role permitted to read `data/holdout` for single-shot OOS replay and DSR audit.",
             allowed_skills=["quant-skeptic-adversary"],
-            denied_path_prefixes=[],  # Allowed to read data/holdout!
+            denied_path_prefixes=[],
             readonly_path_prefixes=["ledger", "data/develop", "data/select", "data/holdout", "handoffs"],
             model_override=frontier_model,
             max_turns=25,
@@ -131,8 +129,6 @@ def build_quant_desk_policies(
 
 
 class QuantDeskLayout:
-    """Initializes the isolated directory tree for a multi-agent quantitative research desk."""
-
     def __init__(self, shared_root: pathlib.Path) -> None:
         self.shared_root = shared_root.resolve()
         self.data_develop = self.shared_root / "data" / "develop"
@@ -160,7 +156,6 @@ class QuantDeskLayout:
         return ws
 
     def write_handoff_packet(self, packet_name: str, payload: Dict[str, Any]) -> pathlib.Path:
-        """Writes a deterministic JSON handoff artifact (stripping narrative bias between agents)."""
         self.handoffs_dir.mkdir(parents=True, exist_ok=True)
         target = self.handoffs_dir / f"{packet_name}.json"
         canonical = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)

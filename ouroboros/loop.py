@@ -1,4 +1,4 @@
-"""Core Recursive Manager Loop with Role-Separated Multi-Agent Isolation, Telegram, & Zero-Downtime Hot-Reload (v0.3.0)."""
+"""Core Recursive Manager Loop with Prompt-Prefix Cache Alignment, Unified Lock, & Industrial Hot-Reload (v0.4.0)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,14 @@ import dataclasses
 import json
 import os
 import pathlib
+import threading
 import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import AgentConfig, ModelProviderConfig
-from ouroboros.hot_reload import HotReloadSupervisor
+from ouroboros.hot_reload import IndustrialReloadSupervisor
+from ouroboros.logger import OuroborosLogger
 from ouroboros.memory import MemoryAndStateStore
 from ouroboros.multi_agent import (
     QuantDeskLayout,
@@ -27,7 +29,7 @@ LLMCallable = Callable[[List[Dict[str, Any]], List[Dict[str, Any]], ModelProvide
 
 
 class OuroborosManagerAgent:
-    """Recursive Autonomous Manager Agent with role-isolated sub-agents, Telegram, and live hot-reloading."""
+    """Recursive Autonomous Manager Agent with role-isolated sub-agents, multi-tier caching, and structured logging."""
 
     def __init__(
         self,
@@ -38,12 +40,15 @@ class OuroborosManagerAgent:
         role_policy: Optional[RoleSandboxPolicy] = None,
         shared_root: Optional[pathlib.Path] = None,
         role_policies_registry: Optional[Dict[str, RoleSandboxPolicy]] = None,
+        execution_lock: Optional[threading.RLock] = None,
     ) -> None:
         self.config = config or AgentConfig()
         self.config.ensure_directories()
         self.recursion_depth = recursion_depth
         self.role_policy = role_policy
         self.shared_root = (shared_root or self.config.workspace_root).resolve()
+        self.execution_lock = execution_lock or threading.RLock()
+        self.logger = OuroborosLogger(self.config.workspace_root / "logs")
         self.quant_layout = QuantDeskLayout(self.shared_root)
         self.quant_layout.ensure_structure()
         self.role_policies_registry = role_policies_registry or build_quant_desk_policies(
@@ -62,14 +67,19 @@ class OuroborosManagerAgent:
             role_policy=self.role_policy,
             shared_root=self.shared_root,
         )
-        self.hot_reload = HotReloadSupervisor(plugins_dir=self.config.plugins_dir)
-        self.telegram = TelegramBotService(agent=self)
+        self.hot_reload = IndustrialReloadSupervisor(plugins_dir=self.config.plugins_dir)
+        self.telegram = TelegramBotService(agent=self, agent_lock=self.execution_lock)
         self.tools.telegram_service = self.telegram
         self.tools.hot_reload_callback = lambda: self.hot_reload.sync_all(self, force=True)
-        # Initial plugin & .env sync
         self.hot_reload.sync_all(self, force=True)
 
     def build_system_prompt(self, role_override: Optional[str] = None) -> str:
+        """Builds a KV-Cache-Aligned System Prompt:
+        - STATIC IMMUTABLE PREFIX FIRST (`SOUL.md` + `Planning Protocol` + `Skill Catalog`)
+          so LLM providers (OpenAI Automatic Prefix Cache / Anthropic Ephemeral Cache) cache 100% of the prefix.
+        - DYNAMIC VOLATILE SUFFIX LAST (`MEMORY.md` + `TASK.md`) so updating `TASK.md` on each turn
+          never busts the static prefix cache!
+        """
         soul = self.memory.read_soul().strip()
         active_role = role_override or (self.role_policy.role_name if self.role_policy else None)
         if active_role:
@@ -87,9 +97,9 @@ class OuroborosManagerAgent:
                     f"\n- Read-Only Paths: {self.role_policy.readonly_path_prefixes}"
                 )
 
+        skill_catalog = self.skills.list_catalog_prompt()
         memory_text = self.memory.read_memory().strip()
         task_text = self.memory.read_task_checklist().strip()
-        skill_catalog = self.skills.list_catalog_prompt()
 
         return (
             f"{soul}\n\n"
@@ -99,11 +109,11 @@ class OuroborosManagerAgent:
             "3. Emit independent tool calls in the same turn for parallel execution.\n"
             "4. For multi-agent workflows (such as `@quant-research-lead`), delegate to isolated specialist roles "
             "(`librarian`, `scout`, `sweeper`, `skeptic`) via `delegate_subagent` with a structured `handoff_payload`.\n"
-            "5. Zero-Downtime Evolution: New tools dropped into `plugins/*.py`, skills in `skills/*/SKILL.md`, "
-            "and `.env` updates are hot-reloaded automatically on every turn without restarting the daemon.\n\n"
-            f"## Active Milestone Checklist (`TASK.md`)\n{task_text}\n\n"
+            "5. Zero-Downtime Evolution: New tools in `plugins/*.py`, skills in `skills/*/SKILL.md`, "
+            "and `.env` updates are synchronized via `IndustrialReloadSupervisor` without dropping state.\n\n"
+            f"## Available On-Demand Skills (`SKILL.md` Catalog)\n{skill_catalog}\n\n"
             f"## Private Role Memory (`MEMORY.md`)\n{memory_text}\n\n"
-            f"## Available On-Demand Skills (`SKILL.md` Catalog)\n{skill_catalog}\n"
+            f"## Active Milestone Checklist (`TASK.md`)\n{task_text}\n"
         )
 
     @staticmethod
@@ -179,96 +189,113 @@ class OuroborosManagerAgent:
         role_override: Optional[str] = None,
         max_turns_override: Optional[int] = None,
     ) -> Dict[str, Any]:
-        # Hot-reload .env, skills/, plugins/*.py, and modified core modules before starting task!
-        self.hot_reload.sync_all(self, force=False)
-
-        session_id = session_id or f"sess_{uuid.uuid4().hex[:10]}"
-        max_turns = max_turns_override or (
-            self.role_policy.max_turns if self.role_policy else self.config.max_turns
-        )
-
-        history = self.memory.load_session(session_id)
-        if not history:
-            history = [{"role": "system", "content": self.build_system_prompt(role_override)}]
-        else:
-            history[0] = {"role": "system", "content": self.build_system_prompt(role_override)}
-
-        if history[-1].get("role") == "user":
-            history[-1]["content"] += f"\n\n{user_prompt}"
-        else:
-            history.append({"role": "user", "content": user_prompt})
-
-        total_tool_calls = 0
-        learning_nudge_injected = False
-        turns_executed = 0
-
-        for turn in range(1, max_turns + 1):
-            turns_executed = turn
-            # Check for live .env, skill, or plugin updates between turns too!
+        with self.execution_lock:
             self.hot_reload.sync_all(self, force=False)
-            history[0]["content"] = self.build_system_prompt(role_override)
-            history = self.compress_context_if_needed(
-                history, self.config.primary_provider.max_context_tokens
+
+            session_id = session_id or f"sess_{uuid.uuid4().hex[:10]}"
+            max_turns = max_turns_override or (
+                self.role_policy.max_turns if self.role_policy else self.config.max_turns
+            )
+            self.logger.info(
+                "task_started",
+                session_id=session_id,
+                role=role_override or (self.role_policy.role_name if self.role_policy else "root"),
+                prompt_preview=user_prompt[:120],
             )
 
-            assistant_msg = self._call_model_with_failover(
-                history, self.tools.get_openai_tool_schemas()
-            )
-            history.append(assistant_msg)
-            self.memory.save_session(session_id, history, status="running")
+            history = self.memory.load_session(session_id)
+            if not history:
+                history = [{"role": "system", "content": self.build_system_prompt(role_override)}]
+            else:
+                history[0] = {"role": "system", "content": self.build_system_prompt(role_override)}
 
-            tool_calls = assistant_msg.get("tool_calls") or []
-            if not tool_calls:
-                if (
-                    total_tool_calls >= self.config.skill_learning_min_tool_calls
-                    and not learning_nudge_injected
-                    and self.recursion_depth == 0
-                ):
-                    learning_nudge_injected = True
-                    history.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "[System Learning Loop Check]: You executed "
-                                f"{total_tool_calls} tool calls to solve this task. "
-                                "If this workflow is reusable on this server, call `save_skill` now "
-                                "to crystallize it; otherwise provide your final concise answer."
-                            ),
-                        }
+            if history[-1].get("role") == "user":
+                history[-1]["content"] += f"\n\n{user_prompt}"
+            else:
+                history.append({"role": "user", "content": user_prompt})
+
+            total_tool_calls = 0
+            learning_nudge_injected = False
+            turns_executed = 0
+
+            for turn in range(1, max_turns + 1):
+                turns_executed = turn
+                self.hot_reload.sync_all(self, force=False)
+                history[0]["content"] = self.build_system_prompt(role_override)
+                history = self.compress_context_if_needed(
+                    history, self.config.primary_provider.max_context_tokens
+                )
+
+                assistant_msg = self._call_model_with_failover(
+                    history, self.tools.get_openai_tool_schemas()
+                )
+                history.append(assistant_msg)
+                self.memory.save_session(session_id, history, status="running")
+
+                tool_calls = assistant_msg.get("tool_calls") or []
+                if not tool_calls:
+                    if (
+                        total_tool_calls >= self.config.skill_learning_min_tool_calls
+                        and not learning_nudge_injected
+                        and self.recursion_depth == 0
+                    ):
+                        learning_nudge_injected = True
+                        history.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[System Learning Loop Check]: You executed "
+                                    f"{total_tool_calls} tool calls to solve this task. "
+                                    "If this workflow is reusable on this server, call `save_skill` now "
+                                    "to crystallize it; otherwise provide your final concise answer."
+                                ),
+                            }
+                        )
+                        continue
+
+                    self.memory.save_session(session_id, history, status="completed")
+                    self.logger.info(
+                        "task_completed",
+                        session_id=session_id,
+                        turns_executed=turns_executed,
+                        total_tool_calls=total_tool_calls,
                     )
-                    continue
+                    return {
+                        "session_id": session_id,
+                        "role": self.role_policy.role_name if self.role_policy else "root_manager",
+                        "isolated_workspace": str(self.config.workspace_root),
+                        "status": "completed",
+                        "turns_executed": turns_executed,
+                        "total_tool_calls": total_tool_calls,
+                        "final_response": assistant_msg.get("content", ""),
+                        "task_checklist": self.memory.read_task_checklist(),
+                    }
 
-                self.memory.save_session(session_id, history, status="completed")
-                return {
-                    "session_id": session_id,
-                    "role": self.role_policy.role_name if self.role_policy else "root_manager",
-                    "isolated_workspace": str(self.config.workspace_root),
-                    "status": "completed",
-                    "turns_executed": turns_executed,
-                    "total_tool_calls": total_tool_calls,
-                    "final_response": assistant_msg.get("content", ""),
-                    "task_checklist": self.memory.read_task_checklist(),
-                }
+                total_tool_calls += len(tool_calls)
+                tool_results = self.tools.execute_tool_calls(session_id, tool_calls)
+                history.extend(tool_results)
+                self.memory.save_session(session_id, history, status="running")
 
-            total_tool_calls += len(tool_calls)
-            tool_results = self.tools.execute_tool_calls(session_id, tool_calls)
-            history.extend(tool_results)
-            self.memory.save_session(session_id, history, status="running")
-
-        self.memory.save_session(session_id, history, status="budget_exhausted")
-        return {
-            "session_id": session_id,
-            "role": self.role_policy.role_name if self.role_policy else "root_manager",
-            "isolated_workspace": str(self.config.workspace_root),
-            "status": "budget_exhausted",
-            "turns_executed": turns_executed,
-            "total_tool_calls": total_tool_calls,
-            "final_response": (
-                f"Iteration budget ({max_turns} turns) reached. "
-                "Current progress has been checkpointed to SQLite and TASK.md."
-            ),
-            "task_checklist": self.memory.read_task_checklist(),
-        }
+            self.memory.save_session(session_id, history, status="budget_exhausted")
+            self.logger.warning(
+                "task_budget_exhausted",
+                session_id=session_id,
+                turns_executed=turns_executed,
+                total_tool_calls=total_tool_calls,
+            )
+            return {
+                "session_id": session_id,
+                "role": self.role_policy.role_name if self.role_policy else "root_manager",
+                "isolated_workspace": str(self.config.workspace_root),
+                "status": "budget_exhausted",
+                "turns_executed": turns_executed,
+                "total_tool_calls": total_tool_calls,
+                "final_response": (
+                    f"Iteration budget ({max_turns} turns) reached. "
+                    "Current progress has been checkpointed to SQLite and TASK.md."
+                ),
+                "task_checklist": self.memory.read_task_checklist(),
+            }
 
     def _spawn_child_agent(
         self,
@@ -311,6 +338,7 @@ class OuroborosManagerAgent:
             role_policy=role_policy,
             shared_root=self.shared_root,
             role_policies_registry=self.role_policies_registry,
+            execution_lock=self.execution_lock,
         )
 
         full_objective = objective
@@ -350,6 +378,7 @@ class OuroborosManagerAgent:
                 return self.llm_callable(messages, tool_schemas, provider)
             except Exception as exc:
                 last_error = exc
+                self.logger.warning("provider_call_failed", provider=provider.name, error=str(exc))
         raise RuntimeError(f"All LLM providers failed. Last error: {last_error}")
 
     @staticmethod
